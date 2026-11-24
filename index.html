@@ -1,6 +1,6 @@
 <!doctype html>
 <!--
-  Normal Maps Web — generador de normal maps + preview con luz, 100% en el navegador.
+  Normal Maps Web — generador de mapas (normal, specular, oclusión) + preview con luz, 100% en el navegador.
   Algoritmos basados en Laigter (https://github.com/azagaya/laigter), (c) Pablo Ivan Fonovich, GPL-3.0-or-later.
   Este archivo es una obra derivada: se distribuye bajo GPL-3.0-or-later (ver LICENSE).
 -->
@@ -40,11 +40,21 @@
     display: flex; flex-direction: column; gap: 18px;
   }
   h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
-  h2 {
+  h2, summary {
     font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
-    color: var(--muted); margin: 0 0 8px; font-weight: 600;
+    color: var(--muted); margin: 0; font-weight: 600;
   }
+  h2 { margin-bottom: 8px; }
   .group { display: flex; flex-direction: column; gap: 10px; }
+  #panels { display: flex; flex-direction: column; gap: 14px; }
+  details.panel { border-top: 1px solid var(--line); padding-top: 12px; }
+  details.panel > summary {
+    cursor: pointer; list-style: none; display: flex; justify-content: space-between; align-items: center;
+  }
+  details.panel > summary::-webkit-details-marker { display: none; }
+  details.panel > summary::after { content: "▾"; }
+  details.panel:not([open]) > summary::after { content: "▸"; }
+  details.panel > .body { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
   .row { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: center; }
   .row output { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
   .row input[type=range] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
@@ -105,7 +115,8 @@
     <div class="btns">
       <button id="btnLoad">Cargar imagen…</button>
       <input id="file" type="file" accept="image/*" hidden>
-      <button id="btnSave" class="primary">Descargar normal map (PNG)</button>
+      <button id="btnSave">Descargar normal map (PNG)</button>
+      <button id="btnZip" class="primary">Descargar todos los mapas (.zip)</button>
     </div>
     <p class="hint">También podés arrastrar una imagen a la ventana.</p>
     <p id="err"></p>
@@ -117,6 +128,8 @@
       <option value="2">Con luz</option>
       <option value="0">Difuso</option>
       <option value="1">Normal map</option>
+      <option value="3">Specular</option>
+      <option value="4">Oclusión</option>
     </select>
     <div class="inline">
       <label><input type="checkbox" id="toon"> Toon</label>
@@ -125,21 +138,7 @@
     <p class="hint">Mové el mouse (o el dedo) sobre la imagen para mover la luz.</p>
   </div>
 
-  <div class="group" id="gNormal">
-    <h2>Mapa normal</h2>
-    <div class="inline">
-      <label><input type="checkbox" id="invX"> Invertir X</label>
-      <label><input type="checkbox" id="invY"> Invertir Y</label>
-    </div>
-  </div>
-
-  <div class="group" id="gLight">
-    <h2>Iluminación</h2>
-    <div class="colors">
-      <label>Luz <input type="color" id="lightCol" value="#ffffff"></label>
-      <label>Ambiente <input type="color" id="ambCol" value="#ffffff"></label>
-    </div>
-  </div>
+  <div id="panels"></div>
 
   <footer>
     Basado en los algoritmos de
@@ -161,48 +160,121 @@
 const $ = s => document.querySelector(s);
 
 /* ------------------------------------------------------------------ estado */
-const P = {                       // parámetros (defaults parecidos a Laigter)
-  depth: 400, blur: 5, invX: false, invY: false,
+const BEVEL_MAX = 128;            // distancia máxima del bevel, en px
+const P = {                       // parámetros
+  depth: 400, blur: 5, tileable: false, invX: false, invY: false,
+  bevelDist: 10, bevelDepth: 50, bevelBlur: 6, bevelSoft: true,
+  specContrast: 100, specThresh: 127, specBright: 0, specBlur: 3, specInvert: false,
+  occDist: true, occDistance: 10, occThresh: 80, occContrast: 100, occBright: 0, occBlur: 3, occInvert: false,
   lightH: 30, diff: 70, spec: 40, scatter: 32, amb: 35,
   view: 2, toon: false, pixelated: false,
 };
 const S = {                       // datos de la imagen actual
   w: 0, h: 0, name: "image",
   src: null,                      // Uint8ClampedArray RGBA (sin premultiplicar)
-  gray: null,                     // Float32Array, luminancia * 10 / 255 (igual que Laigter)
-  blurred: null, blurKey: -1,     // cache del desenfoque
-  normal: null,                   // Uint8ClampedArray RGBA
-  light: { x: 0.3, y: 0.3 },      // posición de la luz en UV de la imagen
+  lum: null,                      // Float32Array, luminancia 0..255
+  gray: null,                     // Float32Array, altura para el emboss: luminancia * 10 / 255 (igual que Laigter)
+  dist: null,                     // distancia (px) al borde de la silueta, o null si la imagen no tiene transparencia
+  emb: null, embKey: null,        // cache: gris desenfocado
+  bevelH: null, bevelKey: null,   // cache: altura del bevel (con perfil y blur)
+  normal: null, spec: null, occ: null,   // mapas finales RGBA
+  light: { x: 0.3, y: 0.3 },      // posición de la luz, fracción del área mostrada
 };
-let dirtyNormal = false, dirtyDraw = false;
+let dirtyNormal = false, dirtySpec = false, dirtyOcc = false, dirtyDraw = false;
 
 /* ------------------------------------------------------------ construir UI */
-const SLIDERS = [
-  { id: "depth",   label: "Profundidad", min: 0,  max: 2000, step: 10, grp: "#gNormal", kind: "normal" },
-  { id: "blur",    label: "Desenfoque",  min: 0,  max: 40,   step: 1,  grp: "#gNormal", kind: "normal" },
-  { id: "lightH",  label: "Altura de la luz",  min: 5, max: 100, step: 1, grp: "#gLight", kind: "draw" },
-  { id: "diff",    label: "Luz difusa",        min: 0, max: 200, step: 1, grp: "#gLight", kind: "draw" },
-  { id: "spec",    label: "Brillo especular",  min: 0, max: 200, step: 1, grp: "#gLight", kind: "draw" },
-  { id: "scatter", label: "Dispersión del brillo", min: 1, max: 255, step: 1, grp: "#gLight", kind: "draw" },
-  { id: "amb",     label: "Luz ambiente",      min: 0, max: 100, step: 1, grp: "#gLight", kind: "draw" },
+const GROUPS = [
+  { title: "Mapa normal", open: true, items: [
+    { t: "range", id: "depth", label: "Profundidad", min: 0, max: 2000, step: 10, kind: "normal" },
+    { t: "range", id: "blur", label: "Desenfoque", min: 0, max: 40, step: 1, kind: "normal" },
+    { t: "check", id: "tileable", label: "Tileable (vista 2×2)", kind: "tile" },
+    { t: "check", id: "invX", label: "Invertir X", kind: "normal" },
+    { t: "check", id: "invY", label: "Invertir Y", kind: "normal" },
+  ]},
+  { title: "Bevel (silueta)", open: true, items: [
+    { t: "hint", text: "Usa la transparencia de la imagen como silueta. Sin transparencia no hay bevel." },
+    { t: "range", id: "bevelDist", label: "Distancia (px)", min: 1, max: BEVEL_MAX, step: 1, kind: "normal" },
+    { t: "range", id: "bevelDepth", label: "Profundidad", min: 0, max: 400, step: 5, kind: "normal" },
+    { t: "range", id: "bevelBlur", label: "Desenfoque", min: 0, max: 40, step: 1, kind: "normal" },
+    { t: "check", id: "bevelSoft", label: "Bevel suave (redondeado)", kind: "normal" },
+  ]},
+  { title: "Specular", open: false, items: [
+    { t: "range", id: "specContrast", label: "Contraste (%)", min: 0, max: 400, step: 1, kind: "spec" },
+    { t: "range", id: "specThresh", label: "Umbral", min: 0, max: 255, step: 1, kind: "spec" },
+    { t: "range", id: "specBright", label: "Brillo", min: -255, max: 255, step: 1, kind: "spec" },
+    { t: "range", id: "specBlur", label: "Desenfoque", min: 0, max: 50, step: 1, kind: "spec" },
+    { t: "check", id: "specInvert", label: "Invertir", kind: "spec" },
+  ]},
+  { title: "Oclusión", open: false, items: [
+    { t: "hint", text: "Modo distancia: oscurece alrededor de las zonas más oscuras que el umbral. Sin él, usa la luminancia." },
+    { t: "range", id: "occDistance", label: "Distancia (px)", min: 1, max: BEVEL_MAX, step: 1, kind: "occ" },
+    { t: "range", id: "occThresh", label: "Umbral", min: 0, max: 255, step: 1, kind: "occ" },
+    { t: "range", id: "occContrast", label: "Contraste (%)", min: 0, max: 400, step: 1, kind: "occ" },
+    { t: "range", id: "occBright", label: "Brillo", min: -255, max: 255, step: 1, kind: "occ" },
+    { t: "range", id: "occBlur", label: "Desenfoque", min: 0, max: 50, step: 1, kind: "occ" },
+    { t: "check", id: "occDist", label: "Modo distancia", kind: "occ" },
+    { t: "check", id: "occInvert", label: "Invertir", kind: "occ" },
+  ]},
+  { title: "Iluminación", open: true, items: [
+    { t: "range", id: "lightH", label: "Altura de la luz", min: 5, max: 100, step: 1, kind: "draw" },
+    { t: "range", id: "diff", label: "Luz difusa", min: 0, max: 200, step: 1, kind: "draw" },
+    { t: "range", id: "spec", label: "Brillo especular", min: 0, max: 200, step: 1, kind: "draw" },
+    { t: "range", id: "scatter", label: "Dispersión del brillo", min: 1, max: 255, step: 1, kind: "draw" },
+    { t: "range", id: "amb", label: "Luz ambiente", min: 0, max: 100, step: 1, kind: "draw" },
+    { t: "colors" },
+  ]},
 ];
-for (const d of SLIDERS) {
+
+// qué hay que recalcular cuando cambia un control
+function touch(kind) {
+  if (kind === "tile") {
+    computeDistance(); clearCaches();
+    dirtyNormal = dirtySpec = dirtyOcc = true;
+  } else if (kind === "normal") dirtyNormal = true;
+  else if (kind === "spec") dirtySpec = true;
+  else if (kind === "occ") dirtyOcc = true;
+  dirtyDraw = true;
+  schedule();
+}
+
+function rangeRow(it) {
   const row = document.createElement("label");
   row.className = "row";
-  row.innerHTML = `<span>${d.label}</span><output></output>
-    <input type="range" min="${d.min}" max="${d.max}" step="${d.step}">`;
+  row.innerHTML = `<span>${it.label}</span><output></output>
+    <input type="range" min="${it.min}" max="${it.max}" step="${it.step}">`;
   const input = row.querySelector("input"), out = row.querySelector("output");
-  input.value = P[d.id]; out.textContent = P[d.id];
-  input.addEventListener("input", () => {
-    P[d.id] = +input.value; out.textContent = input.value;
-    d.kind === "normal" ? requestNormal() : requestDraw();
-  });
-  // los sliders van antes de los checkboxes / colores del grupo
-  const grp = $(d.grp);
-  grp.insertBefore(row, grp.querySelector(".inline, .colors"));
+  input.value = P[it.id]; out.textContent = P[it.id];
+  input.addEventListener("input", () => { P[it.id] = +input.value; out.textContent = input.value; touch(it.kind); });
+  return row;
 }
-for (const id of ["invX", "invY"]) {
-  $("#" + id).addEventListener("change", e => { P[id] = e.target.checked; requestNormal(); });
+function checkRow(it) {
+  const label = document.createElement("label"), input = document.createElement("input");
+  input.type = "checkbox"; input.checked = P[it.id];
+  label.append(input, " " + it.label);
+  input.addEventListener("change", () => { P[it.id] = input.checked; touch(it.kind); });
+  return label;
+}
+for (const g of GROUPS) {
+  const det = document.createElement("details"), sum = document.createElement("summary"), body = document.createElement("div");
+  det.className = "panel"; det.open = g.open; body.className = "body";
+  sum.textContent = g.title; det.append(sum, body);
+  let inline = null;                               // agrupa checkboxes consecutivos en una fila
+  for (const it of g.items) {
+    if (it.t === "check") {
+      if (!inline) { inline = document.createElement("div"); inline.className = "inline"; body.appendChild(inline); }
+      inline.appendChild(checkRow(it));
+      continue;
+    }
+    inline = null;
+    if (it.t === "range") body.appendChild(rangeRow(it));
+    else if (it.t === "hint") { const p = document.createElement("p"); p.className = "hint"; p.textContent = it.text; body.appendChild(p); }
+    else if (it.t === "colors") body.insertAdjacentHTML("beforeend",
+      `<div class="colors">
+         <label>Luz <input type="color" id="lightCol" value="#ffffff"></label>
+         <label>Ambiente <input type="color" id="ambCol" value="#ffffff"></label>
+       </div>`);
+  }
+  $("#panels").appendChild(det);
 }
 for (const id of ["toon", "pixelated"]) {
   $("#" + id).addEventListener("change", e => {
@@ -215,9 +287,11 @@ $("#view").addEventListener("change", e => { P.view = +e.target.value; requestDr
 $("#lightCol").addEventListener("input", requestDraw);
 $("#ambCol").addEventListener("input", requestDraw);
 
-/* -------------------------------------------------------- normal map (CPU) */
-// gaussiano separable, bordes replicados. sigma = radio / 3 (igual que Laigter)
-function gaussBlur(src, w, h, sigma) {
+/* ------------------------------------------------------ utilidades de imagen */
+const wrapIdx = (v, n) => ((v % n) + n) % n;
+
+// gaussiano separable. sigma = radio / 3 (igual que Laigter). wrap: bordes que se repiten (tileable) o se replican
+function gaussBlur(src, w, h, sigma, wrap) {
   if (sigma <= 0) return src;
   const r = Math.max(1, Math.ceil(sigma * 3));
   const k = new Float32Array(2 * r + 1);
@@ -231,7 +305,8 @@ function gaussBlur(src, w, h, sigma) {
     for (let x = 0; x < w; x++) {
       let a = 0;
       for (let i = -r; i <= r; i++) {
-        let xx = x + i; xx = xx < 0 ? 0 : xx >= w ? w - 1 : xx;
+        let xx = x + i;
+        xx = wrap ? wrapIdx(xx, w) : (xx < 0 ? 0 : xx >= w ? w - 1 : xx);
         a += src[row + xx] * k[i + r];
       }
       tmp[row + x] = a;
@@ -241,7 +316,8 @@ function gaussBlur(src, w, h, sigma) {
     for (let x = 0; x < w; x++) {
       let a = 0;
       for (let i = -r; i <= r; i++) {
-        let yy = y + i; yy = yy < 0 ? 0 : yy >= h ? h - 1 : yy;
+        let yy = y + i;
+        yy = wrap ? wrapIdx(yy, h) : (yy < 0 ? 0 : yy >= h ? h - 1 : yy);
         a += tmp[yy * w + x] * k[i + r];
       }
       out[y * w + x] = a;
@@ -250,40 +326,195 @@ function gaussBlur(src, w, h, sigma) {
   return out;
 }
 
-function computeNormal() {
-  const { w, h, src, gray } = S;
-  if (!src) return;
-  if (S.blurKey !== P.blur) { S.blurred = gaussBlur(gray, w, h, P.blur / 3); S.blurKey = P.blur; }
-  const g = S.blurred;
-  const k = P.depth / 100;
-  const sx = P.invX ? -1 : 1, sy = P.invY ? -1 : 1;
-  const out = S.normal && S.normal.length === w * h * 4 ? S.normal : new Uint8ClampedArray(w * h * 4);
+// transformada de distancia 1D (Felzenszwalb & Huttenlocher), sobre distancias al cuadrado
+function dt1d(f, n, d, v, z) {
+  let k = 0;
+  v[0] = 0; z[0] = -Infinity; z[1] = Infinity;
+  for (let q = 1; q < n; q++) {
+    let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    while (s <= z[k]) {
+      k--;
+      s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    }
+    k++; v[k] = q; z[k] = s; z[k + 1] = Infinity;
+  }
+  k = 0;
+  for (let q = 0; q < n; q++) {
+    while (z[k + 1] < q) k++;
+    d[q] = (q - v[k]) * (q - v[k]) + f[v[k]];
+  }
+}
 
+// distancia euclídea (px) de cada píxel al "source" más cercano. isSource: Uint8Array (1 = distancia 0)
+function distanceTransform(w, h, isSource) {
+  const INF = 1e20, g = new Float32Array(w * h);
+  for (let i = 0; i < g.length; i++) g[i] = isSource[i] ? 0 : INF;
+  const m = Math.max(w, h);
+  const f = new Float64Array(m), d = new Float64Array(m), v = new Int32Array(m), z = new Float64Array(m + 1);
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) f[y] = g[y * w + x];
+    dt1d(f, h, d, v, z);
+    for (let y = 0; y < h; y++) g[y * w + x] = d[y];
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) f[x] = g[y * w + x];
+    dt1d(f, w, d, v, z);
+    for (let x = 0; x < w; x++) g[y * w + x] = d[x];
+  }
+  for (let i = 0; i < g.length; i++) g[i] = Math.sqrt(g[i]);
+  return g;
+}
+
+// igual, pero si wrap = true la imagen se repite: se agrega un margen "pad" con el contenido envuelto
+// (basta con pad >= la distancia máxima que se usa, porque más allá se recorta igual)
+function distanceField(w, h, flag, wrap, pad) {
+  if (!wrap) return distanceTransform(w, h, flag);
+  const W = w + 2 * pad, H = h + 2 * pad, padded = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) {
+    const sy = wrapIdx(y - pad, h) * w;
+    for (let x = 0; x < W; x++) padded[y * W + x] = flag[sy + wrapIdx(x - pad, w)];
+  }
+  const dd = distanceTransform(W, H, padded), out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) out[y * w + x] = dd[(y + pad) * W + x + pad];
+  return out;
+}
+
+// gradiente por diferencias centrales, acumulado en gx/gy escalado por k.
+// Sin wrap, en los bordes usa diferencias de 2º orden de un solo lado (como Laigter)
+function addGradient(g, w, h, wrap, k, gx, gy) {
+  if (!k) return;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const i = y * w + x, o = i * 4;
+      const i = y * w + x;
       let dx, dy;
-      // diferencias centrales; en los bordes, diferencia de 2º orden de un solo lado (como Laigter)
-      if (w < 3) dx = 0;
-      else if (x === 0) dx = -3 * g[i] + 4 * g[i + 1] - g[i + 2];
-      else if (x === w - 1) dx = 3 * g[i] - 4 * g[i - 1] + g[i - 2];
-      else dx = g[i + 1] - g[i - 1];
-      if (h < 3) dy = 0;
-      else if (y === 0) dy = -3 * g[i] + 4 * g[i + w] - g[i + 2 * w];
-      else if (y === h - 1) dy = 3 * g[i] - 4 * g[i - w] + g[i - 2 * w];
-      else dy = g[i + w] - g[i - w];
-
-      let nx = -dx * k * sx, ny = dy * k * sy, nz = 1;
-      const len = Math.hypot(nx, ny, nz);
-      nx /= len; ny /= len; nz /= len;
-      out[o]     = (nx * 0.5 + 0.5) * 255;
-      out[o + 1] = (ny * 0.5 + 0.5) * 255;
-      out[o + 2] = (nz * 0.5 + 0.5) * 255;
-      out[o + 3] = src[o + 3];
+      if (wrap) {
+        dx = g[y * w + (x + 1) % w] - g[y * w + (x + w - 1) % w];
+        dy = g[((y + 1) % h) * w + x] - g[((y + h - 1) % h) * w + x];
+      } else {
+        if (w < 3) dx = 0;
+        else if (x === 0) dx = -3 * g[i] + 4 * g[i + 1] - g[i + 2];
+        else if (x === w - 1) dx = 3 * g[i] - 4 * g[i - 1] + g[i - 2];
+        else dx = g[i + 1] - g[i - 1];
+        if (h < 3) dy = 0;
+        else if (y === 0) dy = -3 * g[i] + 4 * g[i + w] - g[i + 2 * w];
+        else if (y === h - 1) dy = 3 * g[i] - 4 * g[i - w] + g[i - 2 * w];
+        else dy = g[i + w] - g[i - w];
+      }
+      gx[i] += dx * k;
+      gy[i] += dy * k;
     }
+  }
+}
+
+// perfil del bevel: s en [0,1] (0 = borde, 1 = interior) -> altura en [0,1]
+const bevelProfile = s => P.bevelSoft ? Math.sqrt(1 - (s - 1) * (s - 1)) : s;
+
+function clearCaches() { S.embKey = null; S.bevelKey = null; }
+
+// silueta: píxeles con alpha 0 son el "afuera". Sin transparencia no hay silueta (dist = null)
+function computeDistance() {
+  S.dist = null;
+  if (!S.src) return;
+  const { w, h, src } = S, flag = new Uint8Array(w * h);
+  let any = false;
+  for (let i = 0; i < flag.length; i++) if (src[i * 4 + 3] === 0) { flag[i] = 1; any = true; }
+  if (!any) return;
+  if (!P.tileable) {                      // el borde de la imagen cuenta como borde de la silueta (como Laigter)
+    for (let x = 0; x < w; x++) { flag[x] = 1; flag[(h - 1) * w + x] = 1; }
+    for (let y = 0; y < h; y++) { flag[y * w] = 1; flag[y * w + w - 1] = 1; }
+  }
+  S.dist = distanceField(w, h, flag, P.tileable, BEVEL_MAX + 1);
+}
+
+function bevelHeight() {
+  if (!S.dist) return null;
+  const key = [P.bevelDist, P.bevelSoft, P.bevelBlur, P.tileable].join("|");
+  if (S.bevelKey === key) return S.bevelH;
+  const D = Math.max(1, P.bevelDist), n = S.w * S.h, hgt = new Float32Array(n);
+  for (let i = 0; i < n; i++) hgt[i] = bevelProfile(Math.min(S.dist[i] / D, 1));
+  S.bevelH = gaussBlur(hgt, S.w, S.h, P.bevelBlur / 3, P.tileable);
+  S.bevelKey = key;
+  return S.bevelH;
+}
+
+/* ----------------------------------------------------------------- mapas */
+// guarda un mapa en gris (0..255) como RGBA, con el alpha de la imagen original
+function grayToRGBA(v, prev) {
+  const n = S.w * S.h, out = prev && prev.length === n * 4 ? prev : new Uint8ClampedArray(n * 4), src = S.src;
+  for (let i = 0; i < n; i++) {
+    const o = i * 4;
+    out[o] = out[o + 1] = out[o + 2] = v[i];
+    out[o + 3] = src[o + 3];
+  }
+  return out;
+}
+
+function computeNormal() {
+  const { w, h, src } = S;
+  if (!src) return;
+  const wrap = P.tileable, n = w * h;
+  const ekey = P.blur + "|" + wrap;
+  if (S.embKey !== ekey) { S.emb = gaussBlur(S.gray, w, h, P.blur / 3, wrap); S.embKey = ekey; }
+
+  // normal final = emboss (relieve del color) + bevel (relieve de la silueta), sumando pendientes
+  const gx = new Float32Array(n), gy = new Float32Array(n);
+  addGradient(S.emb, w, h, wrap, P.depth / 100, gx, gy);
+  const bh = bevelHeight();
+  if (bh) addGradient(bh, w, h, wrap, (P.bevelDepth / 100) * Math.max(1, P.bevelDist), gx, gy);
+
+  const sx = P.invX ? -1 : 1, sy = P.invY ? -1 : 1;
+  const out = S.normal && S.normal.length === n * 4 ? S.normal : new Uint8ClampedArray(n * 4);
+  for (let i = 0; i < n; i++) {
+    const nx = -gx[i] * sx, ny = gy[i] * sy, len = Math.hypot(nx, ny, 1), o = i * 4;
+    out[o]     = (nx / len * 0.5 + 0.5) * 255;
+    out[o + 1] = (ny / len * 0.5 + 0.5) * 255;
+    out[o + 2] = (1 / len * 0.5 + 0.5) * 255;
+    out[o + 3] = src[o + 3];
   }
   S.normal = out;
   uploadTexture(texN, out);
+}
+
+// specular: contraste alrededor del umbral, brillo, blur, invertir (igual que Laigter)
+function computeSpecular() {
+  const { w, h, lum } = S;
+  if (!lum) return;
+  const n = w * h, c = P.specContrast / 100;
+  let v = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = c * lum[i] + P.specThresh * (1 - c) + P.specBright;
+    v[i] = x < 0 ? 0 : x > 255 ? 255 : x;
+  }
+  v = gaussBlur(v, w, h, P.specBlur / 3, P.tileable);
+  if (P.specInvert) for (let i = 0; i < n; i++) v[i] = 255 - v[i];
+  S.spec = grayToRGBA(v, S.spec);
+  uploadTexture(texS, S.spec);
+}
+
+// oclusión: luminancia (o distancia a las zonas oscuras) con contraste, brillo y blur
+function computeOcclusion() {
+  const { w, h, lum } = S;
+  if (!lum) return;
+  const n = w * h, c = P.occContrast / 100;
+  let v = new Float32Array(n);
+  for (let i = 0; i < n; i++) v[i] = P.occInvert ? 255 - lum[i] : lum[i];
+  if (P.occDist) {
+    const D = Math.max(1, P.occDistance), flag = new Uint8Array(n);
+    for (let i = 0; i < n; i++) flag[i] = v[i] < P.occThresh ? 1 : 0;      // zonas oscuras = fuente de oclusión
+    const d = distanceField(w, h, flag, P.tileable, Math.ceil(D) + 1);
+    for (let i = 0; i < n; i++) {
+      const s = Math.min(d[i] / D, 1);
+      v[i] = 255 * Math.sqrt(1 - (s - 1) * (s - 1));                       // perfil suave, como Laigter
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    const x = c * v[i] + P.occThresh * (1 - c) + P.occBright;
+    v[i] = x < 0 ? 0 : x > 255 ? 255 : x;
+  }
+  v = gaussBlur(v, w, h, P.occBlur / 3, P.tileable);
+  S.occ = grayToRGBA(v, S.occ);
+  uploadTexture(texO, S.occ);
 }
 
 /* ------------------------------------------------------------------ WebGL */
@@ -294,9 +525,12 @@ if (!gl) { $("#err").textContent = "Tu navegador no soporta WebGL."; throw new E
 const VS = `
 attribute vec2 p;
 uniform vec2 scale;
+uniform float tiles;
 varying vec2 uv;
+varying float vTiles;
 void main() {
-  uv = vec2(p.x, 1.0 - p.y);
+  uv = vec2(p.x, 1.0 - p.y) * tiles;
+  vTiles = tiles;
   gl_Position = vec4((p * 2.0 - 1.0) * scale, 0.0, 1.0);
 }`;
 const FS = `
@@ -306,17 +540,23 @@ precision highp float;
 precision mediump float;
 #endif
 varying vec2 uv;
-uniform sampler2D tex, nmap;
-uniform float mode;            // 0 difuso, 1 normal, 2 con luz
-uniform vec3 lightPos;         // xy en UV de la imagen, z = altura
+varying float vTiles;
+uniform sampler2D tex, nmap, smap, omap;
+uniform float mode;            // 0 difuso, 1 normal, 2 con luz, 3 specular, 4 oclusión
+uniform vec3 lightPos;         // xy en las mismas unidades que uv, z = altura
 uniform vec3 lightCol, ambCol;
 uniform float diffI, specI, scatter, ambI, toon;
 uniform vec2 aspect;           // (w, h) / max(w, h): para que la luz sea isótropa
 void main() {
-  vec4 c = texture2D(tex, uv);
-  vec4 n4 = texture2D(nmap, uv);
+  vec2 t = vTiles > 1.5 ? fract(uv) : uv;                 // tileable: se repite la textura
+  vec4 c = texture2D(tex, t);
+  vec4 n4 = texture2D(nmap, t);
   if (mode < 0.5) { gl_FragColor = vec4(c.rgb * c.a, c.a); return; }
   if (mode < 1.5) { gl_FragColor = vec4(n4.rgb * c.a, c.a); return; }
+  vec3 specMap = texture2D(smap, t).rgb;
+  float occ = texture2D(omap, t).r;
+  if (mode > 3.5) { gl_FragColor = vec4(vec3(occ) * c.a, c.a); return; }
+  if (mode > 2.5) { gl_FragColor = vec4(specMap * c.a, c.a); return; }
 
   vec3 N = normalize(n4.rgb * 2.0 - 1.0);                 // Y+ hacia arriba (convención OpenGL)
   vec2 d = (lightPos.xy - uv) * aspect;
@@ -328,8 +568,8 @@ void main() {
     diff = smoothstep(0.495, 0.505, diff);
     spec = smoothstep(0.005, 0.01, spec);
   }
-  // igual que Laigter: textura * (difuso + especular + ambiente)
-  vec3 lit = c.rgb * (diff * diffI * lightCol + spec * specI * lightCol + ambI * ambCol);
+  // como Laigter: textura * (difuso + especular * mapa specular + ambiente * oclusión)
+  vec3 lit = c.rgb * (diff * diffI * lightCol + spec * specI * lightCol * specMap + ambI * ambCol * occ);
   gl_FragColor = vec4(lit * c.a, c.a);
 }`;
 
@@ -354,7 +594,7 @@ gl.enableVertexAttribArray(loc);
 gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
 
 const U = {};
-for (const n of ["scale","tex","nmap","mode","lightPos","lightCol","ambCol","diffI","specI","scatter","ambI","toon","aspect"])
+for (const n of ["scale","tiles","tex","nmap","smap","omap","mode","lightPos","lightCol","ambCol","diffI","specI","scatter","ambI","toon","aspect"])
   U[n] = gl.getUniformLocation(prog, n);
 
 function makeTexture() {
@@ -364,7 +604,7 @@ function makeTexture() {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   return t;
 }
-const texD = makeTexture(), texN = makeTexture();
+const texD = makeTexture(), texN = makeTexture(), texS = makeTexture(), texO = makeTexture();
 function uploadTexture(t, data) {
   gl.bindTexture(gl.TEXTURE_2D, t);
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
@@ -375,7 +615,7 @@ function uploadTexture(t, data) {
 }
 function applyFilter(only) {
   const f = P.pixelated ? gl.NEAREST : gl.LINEAR;
-  for (const t of only ? [only] : [texD, texN]) {
+  for (const t of only ? [only] : [texD, texN, texS, texO]) {
     gl.bindTexture(gl.TEXTURE_2D, t);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
@@ -383,12 +623,15 @@ function applyFilter(only) {
 }
 applyFilter();
 
+const tiles = () => P.tileable ? 2 : 1;
+
 // rectángulo (en px CSS) donde se dibuja la imagen dentro del canvas
 function imageRect() {
   const cw = canvas.clientWidth, ch = canvas.clientHeight;
   if (!S.w) return { x: 0, y: 0, w: cw, h: ch };
-  const f = Math.min(cw / S.w, ch / S.h) * 0.94;
-  const w = S.w * f, h = S.h * f;
+  const T = tiles(), iw = S.w * T, ih = S.h * T;
+  const f = Math.min(cw / iw, ch / ih) * 0.94;
+  const w = iw * f, h = ih * f;
   return { x: (cw - w) / 2, y: (ch - h) / 2, w, h };
 }
 
@@ -404,14 +647,17 @@ function draw() {
   gl.clear(gl.COLOR_BUFFER_BIT);
   if (!S.w) return;
 
-  const r = imageRect();
+  const r = imageRect(), T = tiles();
   const m = Math.max(S.w, S.h);
   gl.uniform2f(U.scale, r.w / canvas.clientWidth, r.h / canvas.clientHeight);
-  gl.uniform1i(U.tex, 0); gl.uniform1i(U.nmap, 1);
+  gl.uniform1f(U.tiles, T);
+  gl.uniform1i(U.tex, 0); gl.uniform1i(U.nmap, 1); gl.uniform1i(U.smap, 2); gl.uniform1i(U.omap, 3);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texD);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texN);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texS);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texO);
   gl.uniform1f(U.mode, P.view);
-  gl.uniform3f(U.lightPos, S.light.x, S.light.y, P.lightH / 100);
+  gl.uniform3f(U.lightPos, S.light.x * T, S.light.y * T, P.lightH / 100);
   gl.uniform3fv(U.lightCol, hex($("#lightCol").value));
   gl.uniform3fv(U.ambCol, hex($("#ambCol").value));
   gl.uniform1f(U.diffI, P.diff / 100);
@@ -425,17 +671,19 @@ function draw() {
 }
 
 /* ----------------------------------------------------------------- loop */
-function requestNormal() { dirtyNormal = dirtyDraw = true; schedule(); }
 function requestDraw() { dirtyDraw = true; schedule(); }
 let scheduled = false;
 function schedule() {
   if (scheduled) return;
   scheduled = true;
-  requestAnimationFrame(() => {
-    scheduled = false;
-    if (dirtyNormal) { dirtyNormal = false; computeNormal(); }
-    if (dirtyDraw) draw();
-  });
+  requestAnimationFrame(() => { scheduled = false; flush(); });
+}
+// recalcula lo pendiente y redibuja
+function flush() {
+  if (dirtyNormal) { dirtyNormal = false; computeNormal(); }
+  if (dirtySpec) { dirtySpec = false; computeSpecular(); }
+  if (dirtyOcc) { dirtyOcc = false; computeOcclusion(); }
+  if (dirtyDraw) draw();
 }
 new ResizeObserver(requestDraw).observe($("#stage"));
 
@@ -465,13 +713,28 @@ function setImage(imgData, name) {
   S.w = imgData.width; S.h = imgData.height; S.name = name;
   S.src = imgData.data;
   const n = S.w * S.h, d = S.src;
+  S.lum = new Float32Array(n);
   S.gray = new Float32Array(n);
-  for (let i = 0; i < n; i++)             // luminancia, escalada igual que Laigter (gris * 10 / 255)
-    S.gray[i] = (0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]) * 10 / 255;
-  S.blurKey = -1; S.blurred = null; S.normal = null;
+  let sum = 0, cnt = 0;
+  for (let i = 0; i < n; i++) {
+    const l = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+    S.lum[i] = l;
+    if (d[i * 4 + 3] > 0) { sum += l; cnt++; }
+  }
+  // los píxeles transparentes toman la luminancia media (en vez de negro): así la silueta no genera
+  // una pendiente falsa en el emboss ni un borde oscuro en la oclusión; el borde lo resuelve el bevel
+  const fill = cnt ? sum / cnt : 0;
+  for (let i = 0; i < n; i++) {
+    if (d[i * 4 + 3] === 0) S.lum[i] = fill;
+    S.gray[i] = S.lum[i] * 10 / 255;
+  }
+
+  clearCaches();
+  S.emb = S.bevelH = S.normal = S.spec = S.occ = null;
   uploadTexture(texD, S.src);
   S.light = { x: 0.3, y: 0.3 };
-  computeNormal();
+  computeDistance();
+  computeNormal(); computeSpecular(); computeOcclusion();
   draw();
 }
 
@@ -505,23 +768,101 @@ addEventListener("drop", e => {
 });
 
 /* ------------------------------------------------------------ descargar */
-$("#btnSave").addEventListener("click", () => {
-  if (!S.normal) return;
+function rgbaToCanvas(data) {
   const c = document.createElement("canvas"); c.width = S.w; c.height = S.h;
-  c.getContext("2d").putImageData(new ImageData(S.normal, S.w, S.h), 0, 0);
-  c.toBlob(b => {
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(b); a.download = S.name + "_n.png";
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  }, "image/png");
+  c.getContext("2d").putImageData(new ImageData(data, S.w, S.h), 0, 0);
+  return c;
+}
+const canvasToPng = c => new Promise(res => c.toBlob(res, "image/png"));
+function download(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// zip sin compresión (método "store"): alcanza para PNGs, que ya vienen comprimidos
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(u8) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 255] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function makeZip(files) {           // files: [{ name, data: Uint8Array }] -> array de partes para new Blob()
+  const enc = new TextEncoder(), parts = [], central = [], now = new Date();
+  const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+  const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  let offset = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+
+    const lh = new DataView(new ArrayBuffer(30));          // cabecera local
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true);
+    lh.setUint16(8, 0, true); lh.setUint16(10, dosTime, true); lh.setUint16(12, dosDate, true);
+    lh.setUint32(14, crc, true); lh.setUint32(18, size, true); lh.setUint32(22, size, true);
+    lh.setUint16(26, name.length, true); lh.setUint16(28, 0, true);
+    parts.push(new Uint8Array(lh.buffer), name, f.data);
+
+    const ch = new DataView(new ArrayBuffer(46));          // entrada del directorio central
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true);
+    ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true);
+    ch.setUint16(12, dosTime, true); ch.setUint16(14, dosDate, true);
+    ch.setUint32(16, crc, true); ch.setUint32(20, size, true); ch.setUint32(24, size, true);
+    ch.setUint16(28, name.length, true); ch.setUint16(30, 0, true); ch.setUint16(32, 0, true);
+    ch.setUint16(34, 0, true); ch.setUint16(36, 0, true); ch.setUint32(38, 0, true);
+    ch.setUint32(42, offset, true);
+    central.push(new Uint8Array(ch.buffer), name);
+
+    offset += 30 + name.length + size;
+  }
+  let cdSize = 0;
+  for (const p of central) cdSize += p.length;
+  const end = new DataView(new ArrayBuffer(22));           // fin del directorio central
+  end.setUint32(0, 0x06054b50, true); end.setUint16(4, 0, true); end.setUint16(6, 0, true);
+  end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true); end.setUint16(20, 0, true);
+  return [...parts, ...central, new Uint8Array(end.buffer)];
+}
+
+$("#btnSave").addEventListener("click", async () => {
+  if (!S.normal) return;
+  flush();
+  download(await canvasToPng(rgbaToCanvas(S.normal)), S.name + "_n.png");
+});
+$("#btnZip").addEventListener("click", async () => {
+  if (!S.normal) return;
+  flush();
+  try {
+    const files = [];
+    for (const [suffix, data] of [["_n", S.normal], ["_s", S.spec], ["_o", S.occ]]) {
+      const blob = await canvasToPng(rgbaToCanvas(data));
+      files.push({ name: S.name + suffix + ".png", data: new Uint8Array(await blob.arrayBuffer()) });
+    }
+    download(new Blob(makeZip(files), { type: "application/zip" }), S.name + "_maps.zip");
+  } catch (e) {
+    $("#err").textContent = "No pude armar el zip: " + e.message;
+  }
 });
 
 /* ------------------------------------------------------------ demo inicial */
+// una placa de ladrillos con bordes redondeados sobre fondo transparente (para que se vea el bevel)
 function demoImage() {
   const w = 256, h = 256, c = document.createElement("canvas"); c.width = w; c.height = h;
   const x = c.getContext("2d", { willReadFrequently: true });
   let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const m = 22;                                              // margen transparente
+  x.save();
+  x.beginPath();
+  (x.roundRect || x.rect).call(x, m, m, w - 2 * m, h - 2 * m, 28);
+  x.clip();
   x.fillStyle = "#2a2522"; x.fillRect(0, 0, w, h);            // mortero oscuro = zona baja
   const bw = 64, bh = 32, gap = 5;
   for (let row = 0; row * bh < h; row++) {
@@ -533,8 +874,10 @@ function demoImage() {
       x.fill();
     }
   }
+  x.restore();
   const id = x.getImageData(0, 0, w, h), d = id.data;
-  for (let i = 0; i < d.length; i += 4) {                      // grano
+  for (let i = 0; i < d.length; i += 4) {                      // grano (solo donde hay imagen)
+    if (d[i + 3] === 0) continue;
     const v = (rnd() - 0.5) * 46;
     d[i] += v; d[i + 1] += v; d[i + 2] += v;
   }
