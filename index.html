@@ -1,0 +1,546 @@
+<!doctype html>
+<!--
+  Normal Maps Web — generador de normal maps + preview con luz, 100% en el navegador.
+  Algoritmos basados en Laigter (https://github.com/azagaya/laigter), (c) Pablo Ivan Fonovich, GPL-3.0-or-later.
+  Este archivo es una obra derivada: se distribuye bajo GPL-3.0-or-later (ver LICENSE).
+-->
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Normal Maps Web</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f25; --panel2: #23272f; --line: #2f343d;
+    --text: #e6e8ec; --muted: #9097a3; --accent: #6aa7ff; --accent-ink: #0b1220;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #eef0f3; --panel: #ffffff; --panel2: #f3f5f8; --line: #d7dbe2;
+    --text: #1b1f27; --muted: #5b6372; --accent: #2563eb; --accent-ink: #ffffff;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #eef0f3; --panel: #ffffff; --panel2: #f3f5f8; --line: #d7dbe2;
+      --text: #1b1f27; --muted: #5b6372; --accent: #2563eb; --accent-ink: #ffffff;
+      color-scheme: light;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: grid; grid-template-columns: 320px 1fr; min-height: 100vh;
+  }
+  aside {
+    background: var(--panel); border-right: 1px solid var(--line);
+    padding: 16px; overflow-y: auto; max-height: 100vh;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+  h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin: 0 0 8px; font-weight: 600;
+  }
+  .group { display: flex; flex-direction: column; gap: 10px; }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: center; }
+  .row output { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  .row input[type=range] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+  .inline { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .inline label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .colors { display: flex; gap: 14px; }
+  .colors label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+  input[type=color] {
+    width: 34px; height: 24px; padding: 0; border: 1px solid var(--line);
+    border-radius: 6px; background: none; cursor: pointer;
+  }
+  select, button {
+    font: inherit; color: var(--text); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; cursor: pointer;
+  }
+  select { width: 100%; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  .btns { display: flex; flex-direction: column; gap: 8px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 0; }
+  footer { margin-top: auto; color: var(--muted); font-size: 11px; }
+  footer a { color: var(--accent); }
+  main { position: relative; min-width: 0; min-height: 0; }
+  #stage {
+    position: absolute; inset: 0; overflow: hidden;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(45deg, var(--panel) 25%, transparent 25%, transparent 75%, var(--panel) 75%),
+      linear-gradient(45deg, var(--panel) 25%, transparent 25%, transparent 75%, var(--panel) 75%);
+    background-size: 20px 20px; background-position: 0 0, 10px 10px;
+  }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+  #marker {
+    position: absolute; width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%;
+    border: 2px solid #fff; box-shadow: 0 0 0 1px #000, 0 0 12px 2px rgba(255,255,255,.5);
+    pointer-events: none; display: none;
+  }
+  #drop {
+    position: absolute; inset: 12px; border: 2px dashed var(--accent); border-radius: 14px;
+    background: color-mix(in srgb, var(--bg) 70%, transparent);
+    display: none; align-items: center; justify-content: center; font-size: 18px; pointer-events: none;
+  }
+  body.dragging #drop { display: flex; }
+  #err { color: #ff8a80; font-size: 12px; min-height: 1em; margin: 0; }
+  @media (max-width: 760px) {
+    body { grid-template-columns: 1fr; grid-template-rows: 60vh auto; }
+    main { order: -1; }
+    aside { max-height: none; border-right: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<aside>
+  <h1>Normal Maps Web</h1>
+
+  <div class="group">
+    <h2>Imagen</h2>
+    <div class="btns">
+      <button id="btnLoad">Cargar imagen…</button>
+      <input id="file" type="file" accept="image/*" hidden>
+      <button id="btnSave" class="primary">Descargar normal map (PNG)</button>
+    </div>
+    <p class="hint">También podés arrastrar una imagen a la ventana.</p>
+    <p id="err"></p>
+  </div>
+
+  <div class="group">
+    <h2>Vista</h2>
+    <select id="view">
+      <option value="2">Con luz</option>
+      <option value="0">Difuso</option>
+      <option value="1">Normal map</option>
+    </select>
+    <div class="inline">
+      <label><input type="checkbox" id="toon"> Toon</label>
+      <label><input type="checkbox" id="pixelated"> Pixelado</label>
+    </div>
+    <p class="hint">Mové el mouse (o el dedo) sobre la imagen para mover la luz.</p>
+  </div>
+
+  <div class="group" id="gNormal">
+    <h2>Mapa normal</h2>
+    <div class="inline">
+      <label><input type="checkbox" id="invX"> Invertir X</label>
+      <label><input type="checkbox" id="invY"> Invertir Y</label>
+    </div>
+  </div>
+
+  <div class="group" id="gLight">
+    <h2>Iluminación</h2>
+    <div class="colors">
+      <label>Luz <input type="color" id="lightCol" value="#ffffff"></label>
+      <label>Ambiente <input type="color" id="ambCol" value="#ffffff"></label>
+    </div>
+  </div>
+
+  <footer>
+    Basado en los algoritmos de
+    <a href="https://github.com/azagaya/laigter" target="_blank" rel="noopener">Laigter</a>
+    (GPL-3.0).
+  </footer>
+</aside>
+
+<main>
+  <div id="stage">
+    <canvas id="gl"></canvas>
+    <div id="marker"></div>
+    <div id="drop">Soltá la imagen acá</div>
+  </div>
+</main>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+
+/* ------------------------------------------------------------------ estado */
+const P = {                       // parámetros (defaults parecidos a Laigter)
+  depth: 400, blur: 5, invX: false, invY: false,
+  lightH: 30, diff: 70, spec: 40, scatter: 32, amb: 35,
+  view: 2, toon: false, pixelated: false,
+};
+const S = {                       // datos de la imagen actual
+  w: 0, h: 0, name: "image",
+  src: null,                      // Uint8ClampedArray RGBA (sin premultiplicar)
+  gray: null,                     // Float32Array, luminancia * 10 / 255 (igual que Laigter)
+  blurred: null, blurKey: -1,     // cache del desenfoque
+  normal: null,                   // Uint8ClampedArray RGBA
+  light: { x: 0.3, y: 0.3 },      // posición de la luz en UV de la imagen
+};
+let dirtyNormal = false, dirtyDraw = false;
+
+/* ------------------------------------------------------------ construir UI */
+const SLIDERS = [
+  { id: "depth",   label: "Profundidad", min: 0,  max: 2000, step: 10, grp: "#gNormal", kind: "normal" },
+  { id: "blur",    label: "Desenfoque",  min: 0,  max: 40,   step: 1,  grp: "#gNormal", kind: "normal" },
+  { id: "lightH",  label: "Altura de la luz",  min: 5, max: 100, step: 1, grp: "#gLight", kind: "draw" },
+  { id: "diff",    label: "Luz difusa",        min: 0, max: 200, step: 1, grp: "#gLight", kind: "draw" },
+  { id: "spec",    label: "Brillo especular",  min: 0, max: 200, step: 1, grp: "#gLight", kind: "draw" },
+  { id: "scatter", label: "Dispersión del brillo", min: 1, max: 255, step: 1, grp: "#gLight", kind: "draw" },
+  { id: "amb",     label: "Luz ambiente",      min: 0, max: 100, step: 1, grp: "#gLight", kind: "draw" },
+];
+for (const d of SLIDERS) {
+  const row = document.createElement("label");
+  row.className = "row";
+  row.innerHTML = `<span>${d.label}</span><output></output>
+    <input type="range" min="${d.min}" max="${d.max}" step="${d.step}">`;
+  const input = row.querySelector("input"), out = row.querySelector("output");
+  input.value = P[d.id]; out.textContent = P[d.id];
+  input.addEventListener("input", () => {
+    P[d.id] = +input.value; out.textContent = input.value;
+    d.kind === "normal" ? requestNormal() : requestDraw();
+  });
+  // los sliders van antes de los checkboxes / colores del grupo
+  const grp = $(d.grp);
+  grp.insertBefore(row, grp.querySelector(".inline, .colors"));
+}
+for (const id of ["invX", "invY"]) {
+  $("#" + id).addEventListener("change", e => { P[id] = e.target.checked; requestNormal(); });
+}
+for (const id of ["toon", "pixelated"]) {
+  $("#" + id).addEventListener("change", e => {
+    P[id] = e.target.checked;
+    if (id === "pixelated") applyFilter();
+    requestDraw();
+  });
+}
+$("#view").addEventListener("change", e => { P.view = +e.target.value; requestDraw(); });
+$("#lightCol").addEventListener("input", requestDraw);
+$("#ambCol").addEventListener("input", requestDraw);
+
+/* -------------------------------------------------------- normal map (CPU) */
+// gaussiano separable, bordes replicados. sigma = radio / 3 (igual que Laigter)
+function gaussBlur(src, w, h, sigma) {
+  if (sigma <= 0) return src;
+  const r = Math.max(1, Math.ceil(sigma * 3));
+  const k = new Float32Array(2 * r + 1);
+  let sum = 0;
+  for (let i = -r; i <= r; i++) { k[i + r] = Math.exp(-(i * i) / (2 * sigma * sigma)); sum += k[i + r]; }
+  for (let i = 0; i < k.length; i++) k[i] /= sum;
+
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {                 // horizontal
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      let a = 0;
+      for (let i = -r; i <= r; i++) {
+        let xx = x + i; xx = xx < 0 ? 0 : xx >= w ? w - 1 : xx;
+        a += src[row + xx] * k[i + r];
+      }
+      tmp[row + x] = a;
+    }
+  }
+  for (let y = 0; y < h; y++) {                 // vertical
+    for (let x = 0; x < w; x++) {
+      let a = 0;
+      for (let i = -r; i <= r; i++) {
+        let yy = y + i; yy = yy < 0 ? 0 : yy >= h ? h - 1 : yy;
+        a += tmp[yy * w + x] * k[i + r];
+      }
+      out[y * w + x] = a;
+    }
+  }
+  return out;
+}
+
+function computeNormal() {
+  const { w, h, src, gray } = S;
+  if (!src) return;
+  if (S.blurKey !== P.blur) { S.blurred = gaussBlur(gray, w, h, P.blur / 3); S.blurKey = P.blur; }
+  const g = S.blurred;
+  const k = P.depth / 100;
+  const sx = P.invX ? -1 : 1, sy = P.invY ? -1 : 1;
+  const out = S.normal && S.normal.length === w * h * 4 ? S.normal : new Uint8ClampedArray(w * h * 4);
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x, o = i * 4;
+      let dx, dy;
+      // diferencias centrales; en los bordes, diferencia de 2º orden de un solo lado (como Laigter)
+      if (w < 3) dx = 0;
+      else if (x === 0) dx = -3 * g[i] + 4 * g[i + 1] - g[i + 2];
+      else if (x === w - 1) dx = 3 * g[i] - 4 * g[i - 1] + g[i - 2];
+      else dx = g[i + 1] - g[i - 1];
+      if (h < 3) dy = 0;
+      else if (y === 0) dy = -3 * g[i] + 4 * g[i + w] - g[i + 2 * w];
+      else if (y === h - 1) dy = 3 * g[i] - 4 * g[i - w] + g[i - 2 * w];
+      else dy = g[i + w] - g[i - w];
+
+      let nx = -dx * k * sx, ny = dy * k * sy, nz = 1;
+      const len = Math.hypot(nx, ny, nz);
+      nx /= len; ny /= len; nz /= len;
+      out[o]     = (nx * 0.5 + 0.5) * 255;
+      out[o + 1] = (ny * 0.5 + 0.5) * 255;
+      out[o + 2] = (nz * 0.5 + 0.5) * 255;
+      out[o + 3] = src[o + 3];
+    }
+  }
+  S.normal = out;
+  uploadTexture(texN, out);
+}
+
+/* ------------------------------------------------------------------ WebGL */
+const canvas = $("#gl");
+const gl = canvas.getContext("webgl", { premultipliedAlpha: true, preserveDrawingBuffer: true });
+if (!gl) { $("#err").textContent = "Tu navegador no soporta WebGL."; throw new Error("no webgl"); }
+
+const VS = `
+attribute vec2 p;
+uniform vec2 scale;
+varying vec2 uv;
+void main() {
+  uv = vec2(p.x, 1.0 - p.y);
+  gl_Position = vec4((p * 2.0 - 1.0) * scale, 0.0, 1.0);
+}`;
+const FS = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 uv;
+uniform sampler2D tex, nmap;
+uniform float mode;            // 0 difuso, 1 normal, 2 con luz
+uniform vec3 lightPos;         // xy en UV de la imagen, z = altura
+uniform vec3 lightCol, ambCol;
+uniform float diffI, specI, scatter, ambI, toon;
+uniform vec2 aspect;           // (w, h) / max(w, h): para que la luz sea isótropa
+void main() {
+  vec4 c = texture2D(tex, uv);
+  vec4 n4 = texture2D(nmap, uv);
+  if (mode < 0.5) { gl_FragColor = vec4(c.rgb * c.a, c.a); return; }
+  if (mode < 1.5) { gl_FragColor = vec4(n4.rgb * c.a, c.a); return; }
+
+  vec3 N = normalize(n4.rgb * 2.0 - 1.0);                 // Y+ hacia arriba (convención OpenGL)
+  vec2 d = (lightPos.xy - uv) * aspect;
+  vec3 L = normalize(vec3(d.x, -d.y, lightPos.z));        // la imagen tiene Y hacia abajo
+  vec3 R = reflect(-L, N);
+  float diff = max(dot(N, L), 0.0);
+  float spec = pow(max(R.z, 0.0), scatter);               // cámara mirando de frente: V = (0,0,1)
+  if (toon > 0.5) {
+    diff = smoothstep(0.495, 0.505, diff);
+    spec = smoothstep(0.005, 0.01, spec);
+  }
+  // igual que Laigter: textura * (difuso + especular + ambiente)
+  vec3 lit = c.rgb * (diff * diffI * lightCol + spec * specI * lightCol + ambI * ambCol);
+  gl_FragColor = vec4(lit * c.a, c.a);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0, 1,0, 0,1, 1,1]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, "p");
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const U = {};
+for (const n of ["scale","tex","nmap","mode","lightPos","lightCol","ambCol","diffI","specI","scatter","ambI","toon","aspect"])
+  U[n] = gl.getUniformLocation(prog, n);
+
+function makeTexture() {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+const texD = makeTexture(), texN = makeTexture();
+function uploadTexture(t, data) {
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, S.w, S.h, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+                new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  applyFilter(t);
+}
+function applyFilter(only) {
+  const f = P.pixelated ? gl.NEAREST : gl.LINEAR;
+  for (const t of only ? [only] : [texD, texN]) {
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
+  }
+}
+applyFilter();
+
+// rectángulo (en px CSS) donde se dibuja la imagen dentro del canvas
+function imageRect() {
+  const cw = canvas.clientWidth, ch = canvas.clientHeight;
+  if (!S.w) return { x: 0, y: 0, w: cw, h: ch };
+  const f = Math.min(cw / S.w, ch / S.h) * 0.94;
+  const w = S.w * f, h = S.h * f;
+  return { x: (cw - w) / 2, y: (ch - h) / 2, w, h };
+}
+
+const hex = v => [1, 3, 5].map(i => parseInt(v.slice(i, i + 2), 16) / 255);
+
+function draw() {
+  dirtyDraw = false;
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.max(1, Math.round(canvas.clientWidth * dpr)), H = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+  gl.viewport(0, 0, W, H);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!S.w) return;
+
+  const r = imageRect();
+  const m = Math.max(S.w, S.h);
+  gl.uniform2f(U.scale, r.w / canvas.clientWidth, r.h / canvas.clientHeight);
+  gl.uniform1i(U.tex, 0); gl.uniform1i(U.nmap, 1);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texD);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texN);
+  gl.uniform1f(U.mode, P.view);
+  gl.uniform3f(U.lightPos, S.light.x, S.light.y, P.lightH / 100);
+  gl.uniform3fv(U.lightCol, hex($("#lightCol").value));
+  gl.uniform3fv(U.ambCol, hex($("#ambCol").value));
+  gl.uniform1f(U.diffI, P.diff / 100);
+  gl.uniform1f(U.specI, P.spec / 100);
+  gl.uniform1f(U.scatter, P.scatter);
+  gl.uniform1f(U.ambI, P.amb / 100);
+  gl.uniform1f(U.toon, P.toon ? 1 : 0);
+  gl.uniform2f(U.aspect, S.w / m, S.h / m);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  updateMarker();
+}
+
+/* ----------------------------------------------------------------- loop */
+function requestNormal() { dirtyNormal = dirtyDraw = true; schedule(); }
+function requestDraw() { dirtyDraw = true; schedule(); }
+let scheduled = false;
+function schedule() {
+  if (scheduled) return;
+  scheduled = true;
+  requestAnimationFrame(() => {
+    scheduled = false;
+    if (dirtyNormal) { dirtyNormal = false; computeNormal(); }
+    if (dirtyDraw) draw();
+  });
+}
+new ResizeObserver(requestDraw).observe($("#stage"));
+
+/* ------------------------------------------------------------ luz / mouse */
+const marker = $("#marker");
+function updateMarker() {
+  const show = S.w && P.view === 2;
+  marker.style.display = show ? "block" : "none";
+  if (!show) return;
+  const r = imageRect();
+  marker.style.left = (r.x + S.light.x * r.w) + "px";
+  marker.style.top = (r.y + S.light.y * r.h) + "px";
+  marker.style.background = $("#lightCol").value;
+}
+function moveLight(e) {
+  if (!S.w) return;
+  const b = canvas.getBoundingClientRect(), r = imageRect();
+  S.light.x = (e.clientX - b.left - r.x) / r.w;
+  S.light.y = (e.clientY - b.top - r.y) / r.h;
+  requestDraw();
+}
+canvas.addEventListener("pointermove", moveLight);
+canvas.addEventListener("pointerdown", e => { canvas.setPointerCapture(e.pointerId); moveLight(e); });
+
+/* ------------------------------------------------------------ cargar imagen */
+function setImage(imgData, name) {
+  S.w = imgData.width; S.h = imgData.height; S.name = name;
+  S.src = imgData.data;
+  const n = S.w * S.h, d = S.src;
+  S.gray = new Float32Array(n);
+  for (let i = 0; i < n; i++)             // luminancia, escalada igual que Laigter (gris * 10 / 255)
+    S.gray[i] = (0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]) * 10 / 255;
+  S.blurKey = -1; S.blurred = null; S.normal = null;
+  uploadTexture(texD, S.src);
+  S.light = { x: 0.3, y: 0.3 };
+  computeNormal();
+  draw();
+}
+
+function loadFile(file) {
+  $("#err").textContent = "";
+  if (!file || !file.type.startsWith("image/")) { $("#err").textContent = "Eso no parece una imagen."; return; }
+  const url = URL.createObjectURL(file), img = new Image();
+  img.onload = () => {
+    const maxSide = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), 4096);
+    const f = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * f)), h = Math.max(1, Math.round(img.naturalHeight * f));
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const x = c.getContext("2d", { willReadFrequently: true });
+    x.drawImage(img, 0, 0, w, h);
+    URL.revokeObjectURL(url);
+    setImage(x.getImageData(0, 0, w, h), file.name.replace(/\.[^.]+$/, ""));
+    if (f < 1) $("#err").textContent = `Imagen reducida a ${w}×${h}.`;
+  };
+  img.onerror = () => { URL.revokeObjectURL(url); $("#err").textContent = "No pude leer esa imagen."; };
+  img.src = url;
+}
+$("#btnLoad").addEventListener("click", () => $("#file").click());
+$("#file").addEventListener("change", e => { loadFile(e.target.files[0]); e.target.value = ""; });
+let dragDepth = 0;
+addEventListener("dragenter", e => { e.preventDefault(); dragDepth++; document.body.classList.add("dragging"); });
+addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); } });
+addEventListener("dragover", e => e.preventDefault());
+addEventListener("drop", e => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove("dragging");
+  loadFile(e.dataTransfer.files[0]);
+});
+
+/* ------------------------------------------------------------ descargar */
+$("#btnSave").addEventListener("click", () => {
+  if (!S.normal) return;
+  const c = document.createElement("canvas"); c.width = S.w; c.height = S.h;
+  c.getContext("2d").putImageData(new ImageData(S.normal, S.w, S.h), 0, 0);
+  c.toBlob(b => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(b); a.download = S.name + "_n.png";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }, "image/png");
+});
+
+/* ------------------------------------------------------------ demo inicial */
+function demoImage() {
+  const w = 256, h = 256, c = document.createElement("canvas"); c.width = w; c.height = h;
+  const x = c.getContext("2d", { willReadFrequently: true });
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  x.fillStyle = "#2a2522"; x.fillRect(0, 0, w, h);            // mortero oscuro = zona baja
+  const bw = 64, bh = 32, gap = 5;
+  for (let row = 0; row * bh < h; row++) {
+    const off = (row % 2) * bw / 2;
+    for (let col = -1; col * bw < w; col++) {
+      x.fillStyle = `hsl(${8 + rnd() * 16} 45% ${46 + rnd() * 16}%)`;
+      x.beginPath();
+      (x.roundRect || x.rect).call(x, col * bw + off + gap / 2, row * bh + gap / 2, bw - gap, bh - gap, 5);
+      x.fill();
+    }
+  }
+  const id = x.getImageData(0, 0, w, h), d = id.data;
+  for (let i = 0; i < d.length; i += 4) {                      // grano
+    const v = (rnd() - 0.5) * 46;
+    d[i] += v; d[i + 1] += v; d[i + 2] += v;
+  }
+  return id;
+}
+setImage(demoImage(), "brick");
+</script>
+</body>
+</html>
